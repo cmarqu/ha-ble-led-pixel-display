@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from contextvars import ContextVar
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -18,7 +19,14 @@ if TYPE_CHECKING:
 
 from homeassistant.components import bluetooth
 
-from ..const import WRITE_UUID, NOTIFY_UUID, REDISCOVERY_ATTEMPTS, REDISCOVERY_DELAY
+from ..const import (
+    WRITE_UUID,
+    NOTIFY_UUID,
+    REDISCOVERY_ATTEMPTS,
+    REDISCOVERY_DELAY,
+    RECONNECT_BACKOFF_START,
+    RECONNECT_BACKOFF_MAX,
+)
 from ..exceptions import BleLedPixelConnectionError
 
 # Set while a restore is running in the current task: the number of content
@@ -33,6 +41,10 @@ except ImportError:
     AckManager = None
 
 _LOGGER = logging.getLogger(__name__)
+
+# A link that dies sooner than this after coming up counts as a
+# failed connect for the cooldown below.
+STABLE_LINK_SECONDS = 60
 
 
 # Password frames: [7, 0, 5, 2, ...] verifies, [8, 0, 4, 2, ...] sets or clears.
@@ -93,10 +105,44 @@ class BluetoothClient:
         self._content_writes = 0
         # Called (on the event loop) when the link drops.
         self.on_disconnect: Callable[[], None] | None = None
+        # Connect cooldown, shared by every path that connects
+        # (sends, the reconnect loop, advertisements). Without it a panel
+        # whose link keeps dying gets a fresh connect on every send and every
+        # advertisement, which can churn through many link drops a minute.
+        self._connect_failures = 0
+        self._next_connect_at = 0.0     # time.monotonic()
+        self._connected_at: float | None = None
+
+    def connect_cooldown_remaining(self) -> float:
+        """Seconds until the next connect attempt is allowed (0 if now)."""
+        return max(0.0, self._next_connect_at - time.monotonic())
+
+    def _note_connect_failure(self, why: str) -> None:
+        """Back off further after a failed or short-lived connect."""
+        self._connect_failures += 1
+        delay = min(
+            RECONNECT_BACKOFF_START * 2 ** (self._connect_failures - 1),
+            RECONNECT_BACKOFF_MAX,
+        )
+        self._next_connect_at = time.monotonic() + delay
+        _LOGGER.warning(
+            "LED panel %s: %s; no new connect for %.0fs (failure %d in a row)",
+            self._address, why, delay, self._connect_failures,
+        )
 
     def _disconnected_callback(self, client: BleakClientWithServiceCache) -> None:
         """Called when device disconnects."""
         _LOGGER.warning("LED panel %s disconnected", self._address)
+        # Only a link we had established counts; bleak-retry-connector's
+        # internal attempts also end up here, before _connected is set.
+        if self._connected and self._connected_at is not None:
+            uptime = time.monotonic() - self._connected_at
+            if uptime < STABLE_LINK_SECONDS:
+                self._note_connect_failure(f"link died after {uptime:.0f}s")
+            else:
+                self._connect_failures = 0
+                self._next_connect_at = 0.0
+        self._connected_at = None
         self._connected = False
         # Tell the API, so it starts reconnecting right away instead of on
         # the next advertisement that gets through.
@@ -197,10 +243,17 @@ class BluetoothClient:
             # Another caller may have reconnected while we waited for the lock.
             if self.is_connected:
                 return True
+            remaining = self.connect_cooldown_remaining()
+            if remaining > 0:
+                _LOGGER.debug(
+                    "Not connecting to %s: cooldown, %.0fs left", self._address, remaining
+                )
+                return False
             try:
                 return await self._connect_locked(self._notification_handler)
             except BleLedPixelConnectionError as err:
                 _LOGGER.warning("Reconnect to %s failed: %s", self._address, err)
+                self._note_connect_failure("connect failed")
                 return False
 
     async def _connect_locked(self, notification_handler: Callable[[Any, bytearray], None]) -> bool:
@@ -246,6 +299,7 @@ class BluetoothClient:
             except BaseException:
                 await self._drop_half_open_link()
                 raise
+            self._connected_at = time.monotonic()
             _LOGGER.info("Successfully connected to LED panel")
             return True
 

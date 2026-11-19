@@ -299,7 +299,7 @@ async def _update_textimage_mode(hass: HomeAssistant, device_name: str, api, tex
         # Connect if needed
         if not api.is_connected:
             _LOGGER.debug("Reconnecting to device for display update")
-            await api.connect()
+            await api.ensure_connected()  # respects the connect cooldown
 
         # Resolve templates and process escape sequences
         template_resolved = await resolve_template_variables(hass, text)
@@ -357,7 +357,7 @@ async def _update_clock_mode(hass: HomeAssistant, device_name: str, api) -> bool
         # Connect if needed
         if not api.is_connected:
             _LOGGER.debug("Reconnecting to device for clock mode update")
-            await api.connect()
+            await api.ensure_connected()  # respects the connect cooldown
 
         # Send clock mode command
         success = await api.set_clock_mode(
@@ -494,7 +494,7 @@ async def _update_text_mode(hass: HomeAssistant, device_name: str, api, text: st
         # Connect if needed
         if not api.is_connected:
             _LOGGER.debug("Reconnecting to device for text mode update")
-            await api.connect()
+            await api.ensure_connected()  # respects the connect cooldown
 
         # Resolve templates and process escape sequences
         template_resolved = await resolve_template_variables(hass, text)
