@@ -436,6 +436,13 @@ class BleLedPixelAPI:
 
                     if not self._watcher_started:   # integration unloaded meanwhile
                         return
+                    # A connect cooldown (after a failed or
+                    # short-lived link) is waited out, not counted as a
+                    # failed attempt.
+                    cooldown = self._bluetooth.connect_cooldown_remaining()
+                    if cooldown > 0:
+                        delay = max(delay, cooldown)
+                        continue
                     if await self.ensure_connected():
                         _LOGGER.info(
                             "Reconnected to LED panel %s%s", self._address,
